@@ -1,0 +1,2 @@
+# AI-Powered-Surveillance-Object-Detection
+An AI-powered surveillance system integrating object detection, facial recognition, &amp; real-time alerts. Using TensorFlow/Keras &amp; YOLO on Raspberry Pi/ESP32-CAM, it enhances cameras with intrusion detection, fall detection, &amp; vehicle monitoring. Features email alerts, video analytics,  robotics-based GPIO control for intelligent, efficient security.
