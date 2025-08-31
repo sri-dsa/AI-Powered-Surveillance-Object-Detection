@@ -1,0 +1,70 @@
+# Parameters data acquisition
+acquisition:
+  mode_video: Camera # Video, Camera
+  cam_id: 0 # Camera id (if mode_video = Camera); otherwise, video path (if mode_video = Video)
+  num_frames: None # Number of frames to acquire; None = infinite
+  fps: 30 # Frames per second
+  #resolution: (640, 480) # Resolution of the frames
+  #crop: None # Crop the frames; None = no crop
+  #crop_size: (100, 100) # Crop size
+  #crop_position: (0, 0) # Crop position
+  downsample: False # Downsample the frames
+  downsample_rate: 2 # Downsample rate
+  flip: False # Flip the frames
+  rotate: False # Rotate the frames
+  rotate_angle: 0 # Rotate angle  
+  mode_contrast: False # Increase the contrast of the frames
+  contrast_gamma: 0.5 # Contrast gamma
+  black_and_white: False # Convert the frames to black and white
+  mode_ref_mean: True # Reference frame; False = no reference frame
+  num_frames_mean: 100 # Number of frames to calculate the reference frame  
+
+# Object detection:
+detection: 
+  score_thres: 0.2 # Score threshold: small value suffices as we are searching specific classes
+  classes_searched: 
+    - person # Classes to search
+    - 'Male person'
+    - 'Female person'
+    - "Child"
+    - "Woman"
+    - "Man" # IMAGENET
+    - "Person"
+    - "Human face"
+    - "Human hand"
+    - "Human head"
+    - "Animal"
+    - "Bird"
+    - "Dog" # COCO
+  num_frames_freq: 15 # Number of frames to skip between detections (reduce processing + writting output)
+  task: detect
+  # Parameters model
+  # model_mobilenet_v2_hub.yaml 
+  # model_yolov8.yaml
+  model: !include model_mobilenet_v2_hub.yaml 
+
+# Checkpoints: Saving images and videos
+checkpoints:
+  save_images: True # Save images
+  path_save_images: results # Path to save the images; None = no save
+  name_save: ai_surv # Name of the images
+  save_videos: False # Save videos
+  path_save_video: None # Path to save the videos; None = no save
+  #save_videos_fps: 30 # Frames per second of the videos
+  #save_videos_format: mp4v # Format of the videos
+
+# Display: Displaying images and videos
+display:
+  mode_display: True # Display images and videos
+
+# Mail: Sending emails
+mail: 
+  mode_mail: False # Send emails if detection
+  receiver: # receiver@googlemail.com
+  subject: AI-surv detection
+  name: AI-Surv
+  server: mailtrap
+  path_config: ../../mailtrap/mailtrap.yaml # Path to the mailtrap token/password, username and port
+  time_start: 3 # Time to start sending emails in minutes
+  time_interval: 1 # Time interval to send emails in minutes
+  num_stop: 10 # Number of emails to send
