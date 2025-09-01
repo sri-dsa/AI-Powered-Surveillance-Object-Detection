@@ -1,274 +1,186 @@
-# coding=utf-8
-from __future__ import absolute_import
 from __future__ import division
-from __future__ import print_function
-
-import face_detection as m
-import json, cv2, os
-import numpy as np
-from scipy import misc
-import face_preprocess
+import os
+import json
+import threading
+import queue
 import time
+import argparse
+import random 
 
-minsize = int(os.getenv("MINIMAL_FACE_RESOLUTION", default="100"))  # minimum size of face, 100 for 1920x1080 resolution, 70 for 1280x720.
-threads_number = int(os.getenv("THREADS_NUM_FACE_DETECTOR", default="1"))
-image_size = 160
-margin = 16
-BLURY_THREHOLD = 5
+from flask import Flask
+from flask import request
+from flask import jsonify
+import torch 
+import torch.nn as nn
+from torch.autograd import Variable
+import numpy as np
+import cv2 
+from util import *
+from darknet import Darknet
+from preprocess import prep_image, inp_to_image, letterbox_image
+import pandas as pd
+import pickle as pkl
 
-m.init('./model')
-m.set_minsize(minsize)
-m.set_threshold(0.6,0.7,0.8)
-m.set_num_threads(threads_number)
+app = Flask(__name__)
+q = queue.Queue(1)
+classes = load_classes('data/coco.names')
+colors = pkl.load(open("pallete", "rb"))
 
-def get_filePath_fileName_fileExt(filename):
-    (filepath,tempfilename) = os.path.split(filename)
-    (shotname,extension) = os.path.splitext(tempfilename)
-    return filepath, shotname, extension
+def get_test_input(input_dim, CUDA):
+    img = cv2.imread("Khare_frame_02.png")
+    img = cv2.resize(img, (input_dim, input_dim)) 
+    img_ =  img[:,:,::-1].transpose((2,0,1))
+    img_ = img_[np.newaxis,:,:,:]/255.0
+    img_ = torch.from_numpy(img_).float()
+    img_ = Variable(img_)
+    
+    if CUDA:
+        img_ = img_.cuda()
+    
+    return img_
 
-def prewhiten(x):
-    mean = np.mean(x)
-    std = np.std(x)
-    std_adj = np.maximum(std, 1.0/np.sqrt(x.size))
-    y = np.multiply(np.subtract(x, mean), 1/std_adj)
-    return y
+def prep_image(img, inp_dim):
+    """
+    Prepare image for inputting to the neural network. 
+    
+    Returns a Variable 
+    """
+    orig_im = img
+    dim = orig_im.shape[1], orig_im.shape[0]
+    img = (letterbox_image(orig_im, (inp_dim, inp_dim)))
+    img_ = img[:,:,::-1].transpose((2,0,1)).copy()
+    img_ = torch.from_numpy(img_).float().div(255.0).unsqueeze(0)
+    return img_, orig_im, dim
 
-def resize2square(x1, x2, y1, y2):
-    w = x2 - x1
-    h = y2 - y1
-    delt = 0
-    if w > h:
-        delt = w -h
-        return x1, x2, (y1 - int(delt/2)), (y2 + int(delt - delt/2))
-    delt = h -w
-    return (x1 - int(delt/2)), (x2 + int(delt - int(delt/2))), y1, y2
+def write(x, img):
+    c1 = tuple(x[1:3].int())
+    c2 = tuple(x[3:5].int())
+    cls = int(x[-1])
+    label = "{0}".format(classes[cls])
+    color = (0,0,255)
+    cv2.rectangle(img, c1, c2,color, 1)
+    t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1 , 1)[0]
+    c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
+    cv2.rectangle(img, c1, c2,color, -1)
+    cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1);
+    return img
 
-def faceBlury(gray_face):
-    #gray_face = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2GRAY)
-    blury_value = cv2.Laplacian(gray_face, cv2.CV_64F).var()
-    return blury_value
+def arg_parse():
+    """
+    Parse arguements to the detect module
+    """
+    parser = argparse.ArgumentParser(description='YOLO v3 Video Detection Module')
+    parser.add_argument("--video", dest = 'video', help = 
+                        "Video to run detection upon",
+                        default = "video.avi", type = str)
+    parser.add_argument("--dataset", dest = "dataset", help = "Dataset on which the network has been trained", default = "pascal")
+    parser.add_argument("--confidence", dest = "confidence", help = "Object Confidence to filter predictions", default = 0.5)
+    parser.add_argument("--nms_thresh", dest = "nms_thresh", help = "NMS Threshhold", default = 0.4)
+    parser.add_argument("--cfg", dest = 'cfgfile', help = 
+                        "Config file",
+                        default = "cfg/yolov3.cfg", type = str)
+    parser.add_argument("--weights", dest = 'weightsfile', help = 
+                        "weightsfile",
+                        default = "yolov3.weights", type = str)
+    parser.add_argument("--reso", dest = 'reso', help = 
+                        "Input resolution of the network. Increase to increase accuracy. Decrease to increase speed",
+                        default = "800", type = str)
+    return parser.parse_args()
 
-def faceStyle(landmark, bb, face_width):
-    style = []
+@app.route('/submit/image', methods=['POST'])
+def submit_image():
+    json_data = json.loads(request.data)
+    camera_id = json_data['args'][0]
+    filename = json_data['args'][1]
+    print(f'filename: {filename}, camera_id: {camera_id}')
 
-    eye_1 = landmark[0]
-    eye_2 = landmark[1]
-    nose = landmark[2]
-    mouth_1 = landmark[3]
-    mouth_2 = landmark[4]
+    try:
+        q.put_nowait(filename)
+        return 'processing', 200
+    except:
+        os.remove(filename)
+        return 'skip frame', 200
 
-    middle_point = (bb[2] + bb[0])/2
-    y_middle_point = (bb[3] + bb[1]) / 2
-    eye_distance = abs(eye_1[0]-eye_2[0])
-    if eye_distance < 2:
-        print('(Eye distance less than 2 pixels) Add style')
-        style.append('side_face')
-    elif eye_1[0] > middle_point:
-        print('(Left Eye on the Right) Add style')
-        style.append('left_side')
-        # continue
-    elif eye_2[0] < middle_point:
-        print('(Right Eye on the left) Add style')
-        style.append('right_side')
-        # continue
-    elif max(eye_1[1], eye_2[1]) > y_middle_point:
-        print('(Eye lower than middle of face) Skip')
-        style.append('lower_head')
-    elif face_width/eye_distance > 6:
-        print('side_face, eye distance is {}, face width is {}'.format(eye_distance,face_width))
-        style.append('side_face')
-    #elif nose[1] < y_middle_point:
-    #    # 鼻子的y轴高于图片的中间高度，就认为是抬头
-    #    style.append('raise_head')
-    else:
-        style.append('front')
-    return style
+def worker():
+    args = arg_parse()
+    confidence = float(args.confidence)
+    nms_thesh = float(args.nms_thresh)
+    start = 0
+    CUDA = torch.cuda.is_available()
+    num_classes = 1
+    CUDA = torch.cuda.is_available()
+    bbox_attrs = 5 + num_classes
+    print("Loading network.....")
+    model = Darknet(args.cfgfile)
+    model.load_weights(args.weightsfile)
+    print("Network successfully loaded")
+    model.net_info["height"] = args.reso
+    inp_dim = int(model.net_info["height"])
+    if CUDA:
+        model.cuda()
+        
+    model(get_test_input(inp_dim, CUDA), CUDA)
+    model.eval()
+    
+    frames = 0
+    start = time.time()
 
-def load_align_image(result, image_path, trackerid, ts, cameraId):
-    detected = False
-    people_cnt = 0
-    cropped = []
-    nrof_faces = 0
+    while True:        
+        item = q.get()
+        print(f'Working on {item}')
+        img = cv2.imread(item)
+        frame = cv2.resize(img, (800,600), interpolation = cv2.INTER_AREA)
 
-    if result is None or len(result['result']) < 1:
-        return None, None, None, None
+        img, orig_im, dim = prep_image(frame, inp_dim)
+        im_dim = torch.FloatTensor(dim).repeat(1,2)                        
 
-    results = result['result']
-    if results is None or len(results) < 1:
-        return None, None, None, None
-
-    face_path = {}
-    blury_arr = {}
-    imgs_style = {}
-
-    img = misc.imread(image_path)
-    img_size = np.asarray(img.shape)[0:2]
-    img_w = img_size[1]
-    img_h = img_size[0]
-
-    for i in range(len(results)):
-        item     = results[i]
-        landmark = item['landmark']
-        score    = item['score']
-        bbox     = item['bbox']
-        x1, y1, x2, y2 = bbox
-
-        x1, x2, y1, y2 = resize2square(x1, x2, y1, y2)
-        if x1 <= 0 or y1 <= 0 or x2 >= img_w or y2 >= img_h:
-            print('Out of boundary ({},{},{},{})'.format(x1, y1, x2, y2))
+        if CUDA:
+            im_dim = im_dim.cuda()
+            img = img.cuda()
+        
+        with torch.no_grad():   
+            output = model(Variable(img), CUDA)
+        output = write_results(output, confidence, num_classes, nms = True, nms_conf = nms_thesh)
+        print("count cars {}".format(output.size(0)))
+        
+        if type(output) == int:
+            frames += 1
+            print("FPS of the video is {:5.2f}".format( frames / (time.time() - start)))
+            cv2.imshow("frame", orig_im)
+            key = cv2.waitKey(1)
+            if key & 0xFF == ord('q'):
+                break
             continue
 
-        face_width  = x2 - x1
-        face_height = y2 - y1
+        im_dim = im_dim.repeat(output.size(0), 1)
+        scaling_factor = torch.min(inp_dim/im_dim,1)[0].view(-1,1)
+        
+        output[:,[1,3]] -= (inp_dim - scaling_factor*im_dim[:,0].view(-1,1))/2
+        output[:,[2,4]] -= (inp_dim - scaling_factor*im_dim[:,1].view(-1,1))/2
+        
+        output[:,1:5] /= scaling_factor
 
-        if face_width * face_height  < minsize * minsize:
-            print("to small to recognise ({},{})".format(face_width,face_height))
-            continue
+        for i in range(output.shape[0]):
+            output[i, [1,3]] = torch.clamp(output[i, [1,3]], 0.0, im_dim[i,0])
+            output[i, [2,4]] = torch.clamp(output[i, [2,4]], 0.0, im_dim[i,1])
+        
+        list(map(lambda x: write(x, orig_im), output))
+        empty = 60 - output.size(0)
+        cv2.putText(orig_im, "Total empty spots: " + str(empty), (5,30), cv2.FONT_HERSHEY_PLAIN, 1, [0,0,0], 2, cv2.LINE_AA)
+        
+        cv2.imshow("Parking 1", orig_im)
+        key = cv2.waitKey(1)
+        if key & 0xFF == ord('q'):
+            break
+        frames += 1
+        print("FPS of the video is {:5.2f}".format( frames / (time.time() - start)))
+        
+    
+        print(f'Finished {item}')
+        q.task_done()
+    
 
-        #style
-        style = faceStyle(landmark, bbox, face_width)
+# Turn-on the worker thread.
+threading.Thread(target=worker, daemon=True).start()
 
-        #blury
-        cropped = img[y1:y2, x1:x2, :]
-        aligned = misc.imresize(cropped, (160, 160), interp='bilinear')
-
-        # Need to detect if face is too blury to be detected
-        blury_value = faceBlury(aligned)
-        print(blury_value)
-        if blury_value < BLURY_THREHOLD:
-            print('A blur face (%d) captured, avoid it.' %blury_value)
-            style = ['blury']
-        else:
-            print('Blur Value: %d, good'%blury_value)
-
-        new_image_path = image_path.rsplit('.', 1)[0] + '_' + str(i) + '.' + 'png'
-        np.save(new_image_path, aligned)
-        #print('image path saved aligned: ', new_image_path)
-        prewhitened = prewhiten(aligned)
-        face_path[new_image_path] = prewhitened
-        blury_arr[new_image_path] = blury_value
-        imgs_style[new_image_path] = '|'.join(style)
-
-    return len(results), face_path, imgs_style, blury_arr
-
-def load_align_image_v2(result, image_path, trackerid, ts, cameraId, face_filter):
-    detected = False
-    people_cnt = 0
-    cropped = []
-    nrof_faces = 0
-
-   # if result is None or len(result['result']) < 1:
-   #     return None, None, None, None
-
-    results = result['result']
-    if results is None or len(results) < 1:
-        return None, None, None, None, None, None
-
-    face_path = {}
-    blury_arr = {}
-    imgs_style = {}
-    face_width_list = {}
-    face_height_list = {}
-
-    img = misc.imread(image_path)
-    img_size = np.asarray(img.shape)[0:2]
-    img_w = img_size[1]
-    img_h = img_size[0]
-
-    for i in range(len(results)):
-        item     = results[i]
-        landmark = item['landmark']
-        score    = item['score']
-        bbox     = item['bbox']
-        #if bbox.shape[0] == 0:
-        #  return None
-        #print("bbox {}--- {}, landmark {} ----- {}".format(type(bbox), bbox,type(landmark),landmark))
-
-        x1, y1, x2, y2 = bbox
-        if x1 <= 0 or y1 <= 0 or x2 >= img_w or y2 >= img_h:
-            print('Out of boundary ({},{},{},{})'.format(x1, y1, x2, y2))
-            continue
-        face_width  = x2 - x1
-        face_height = y2 - y1
-
-        if face_width * face_height  < minsize * minsize:
-            print("to small to recognise ({},{})".format(face_width,face_height))
-            continue
-
-        #Check if face is misrecognized
-        if face_filter is not None:
-            box = (x1, y1, x2, y2)
-            #crop = img[bb[1]:(bb[3]+bb[1]), bb[0]:(bb[2]+bb[0]), :]
-            cropped = img[y1:y2, x1:x2, :]
-            star_time = time.time()
-            result, rects = face_filter.template_matching(cameraId, cropped, box, image_path)
-            end_time = time.time()
-            print('Performance: template_matching is {}S'.format(end_time-star_time))
-            if result is False:
-                print('filter_face: template_matching is False.')
-            else:
-                print('filter_face: template_matching is True.')
-                continue
-        else:
-            print('face_filter is None, disabled by environment')
-
-        #style
-        style = faceStyle(landmark, bbox, face_width)
-
-        #face_preprocess
-        bbox = x1, x2, y1, y2
-        bbox_nparr = np.array(bbox, dtype=np.float64)
-        points_nparr = np.array(landmark, dtype=np.int32).flatten()
-        points_nparr = points_nparr.reshape((5,2))
-        nimg = face_preprocess.preprocess(image_path, bbox_nparr, points_nparr, image_size='112,112')
-
-        # Need to detect if face is too blury to be detected
-        blury_value = faceBlury(nimg)
-
-        new_image_path = image_path.rsplit('.', 1)[0] + '_' + str(i) + '.' + 'png'
-        misc.imsave(new_image_path, nimg)
-        if blury_value < BLURY_THREHOLD:
-            print('A blur face (%d) captured, avoid it.' %blury_value)
-            style = ['blury']
-        else:
-            print('Blur Value: %d, good'%blury_value)
-
-        #FIXME: BGR2RGB ??
-        #nimg = cv2.cvtColor(nimg, cv2.COLOR_BGR2RGB)
-        #aligned = np.transpose(nimg, (2,0,1))
-
-        #print('img aligned savepath: ',new_np_path)
-        #prewhitened = prewhiten(aligned_img)
-        face_path[new_image_path] = None
-        blury_arr[new_image_path] = blury_value
-        imgs_style[new_image_path] = '|'.join(style)
-        face_width_list[new_image_path] = face_width
-        face_height_list[new_image_path] = face_height
-
-    return len(face_path), face_path, imgs_style, blury_arr, face_width_list, face_height_list
-
-def detect(image_path, trackerid, ts, cameraId, face_filter):
-    result = m.detect(image_path)
-
-    #FIXME:
-    result = result.replace('[,', '[')
-    result = json.loads(result)
-    #print('detect result-----',result)
-    people_cnt = 0
-    cropped = []
-    detected = False
-
-    nrof_faces, img_data, imgs_style, blury_arr, face_width, face_height = load_align_image_v2(result, image_path, trackerid, ts, cameraId, face_filter)
-    if img_data is not None and len(img_data) > 0:
-        people_cnt = len(img_data)
-        detected = True
-        for align_image_path, prewhitened in img_data.items():
-            style=imgs_style[align_image_path]
-            blury=blury_arr[align_image_path]
-            width=face_width[align_image_path]
-            height=face_height[align_image_path]
-            cropped.append({"path": align_image_path, "style": style, "blury": blury, "ts": ts,
-                "trackerid": trackerid, "totalPeople": people_cnt, "cameraId": cameraId,
-                "width":width,"height":height})
-
-    return json.dumps({'detected': detected, "ts": ts, "totalPeople": people_cnt, "cropped": cropped, 'totalmtcnn': nrof_faces})
+app.run(host='0.0.0.0', port=3000)

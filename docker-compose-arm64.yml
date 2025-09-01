@@ -1,7 +1,7 @@
 version: '3.5'
 services:
   redis:
-    image: shareai/redis:x86
+    image: shareai/redis:arm64v8_latest
     restart: always
     container_name: "redis"
     command: sh -c "redis-server --maxmemory 40mb --maxmemory-policy allkeys-lru --save \"\" --appendonly no --dbfilename \"\""
@@ -14,8 +14,8 @@ services:
         max-file: "10"
   etcd:
     container_name: milvus-etcd
-    restart: always
     image: quay.io/coreos/etcd:v3.5.0
+    restart: always
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
@@ -25,8 +25,8 @@ services:
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
   labelstudio:
     container_name: labelstudio
+    image: shareai/label-studio:1.5.0
     restart: always
-    image: heartexlabs/label-studio:v1.5.0
     ports:
       - "8080:8080"
     volumes:
@@ -46,9 +46,10 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+
   milvus:
     container_name: milvus-standalone
-    image: milvusdb/milvus:v2.1.4
+    image: shareai/milvus:arm64_latest
     restart: always
     command: ["milvus", "run", "standalone"]
     environment:
