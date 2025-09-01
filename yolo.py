@@ -1,198 +1,126 @@
-import numpy as np
-import tvm
-import time
-import convert
+import threading
 import cv2
+from ultralytics import YOLO
 
-from darknet import __darknetffi__
-from tvm.contrib import graph_runtime
+class VideoCaptureThread(threading.Thread):
+    def __init__(self, thread_id=1, device_id=0):
+        threading.Thread.__init__(self)
+        self.thread_id = thread_id
+        self.device_id = device_id
+        self.capture = None
+        self.is_running = False
+        self.frame = None
+        self.lock = threading.Lock()
 
+    def assign_source(self, link_url):
+        self.capture = cv2.VideoCapture(link_url)
 
-def get_data(img_path, LIB):
-    start = time.time()
-    orig_image = LIB.load_image_color(img_path.encode('utf-8'), 0, 0)
-    img_w = orig_image.w
-    img_h = orig_image.h
-    img = LIB.letterbox_image(orig_image, 608, 608)
-    LIB.free_image(orig_image)
-    done = time.time()
-    print('1: Image Load run {}'.format((done - start)))
+    def run(self):
+        self.is_running = True
+        print(f"Thread-{self.thread_id}: Starting video capture...")
+        while self.is_running:
+            ret, frame = self.capture.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame
 
-    data = np.empty([img.c, img.h, img.w], 'float32')
-    start = time.time()
-    convert.float32_convert(data, img.data)
-    done = time.time()
-    print('2: data convert in C {}'.format((done - start)))
+    def get_frame(self):
+        with self.lock:
+            return self.frame
 
-    LIB.free_image(img)
-    return img_w, img_h, data
-
-
-def compute_iou(box, boxes, box_area, boxes_area):
-    """Calculates IoU of the given box with the array of the given boxes.
-    box: 1D vector [y1, x1, y2, x2]
-    boxes: [boxes_count, (y1, x1, y2, x2)]
-    box_area: float. the area of 'box'
-    boxes_area: array of length boxes_count.
-    Note: the areas are passed in rather than calculated here for
-    efficiency. Calculate once in the caller to avoid duplicate work.
-    """
-    # Calculate intersection areas
-    y1 = np.maximum(box[0], boxes[:, 0])
-    y2 = np.minimum(box[2], boxes[:, 2])
-    x1 = np.maximum(box[1], boxes[:, 1])
-    x2 = np.minimum(box[3], boxes[:, 3])
-    intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
-    union = box_area + boxes_area[:] - intersection[:]
-    iou = intersection * 1.0 / union
-    return iou
+    def stop(self):
+        print(f"Thread-{self.thread_id}: Stopping video capture...")
+        self.is_running = False
+        if self.capture:
+            self.capture.release()
 
 
-def compute_overlaps(boxes1, boxes2):
-    """Computes IoU overlaps between two sets of boxes.
-    boxes1, boxes2: [N, (y1, x1, y2, x2)].
-    For better performance, pass the largest set first and the smaller second.
-    """
-    # Areas of anchors and GT boxes
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+class VideoObjectDetect(threading.Thread):
+    def __init__(self, thread_id=2, device_id=0):
+        threading.Thread.__init__(self)
+        self.thread_id = thread_id
+        self.device_id = device_id
+        self.model = None
+        self.is_running = False
+        self.input_frame = None
+        self.output_frame = None
+        self.lock = threading.Lock()
 
-    # Compute overlaps to generate matrix [boxes1 count, boxes2 count]
-    # Each cell contains the IoU value.
-    overlaps = np.zeros((boxes1.shape[0], boxes2.shape[0]))
-    for i in range(overlaps.shape[1]):
-        box2 = boxes2[i]
-        overlaps[:, i] = compute_iou(box2, boxes1, area2[i], area1)
-    return overlaps
+    def load_model(self, model_name):
+        self.model = YOLO(model_name)
+
+    def set_input_frame(self, frame):
+        with self.lock:
+            self.input_frame = frame
+
+    def get_output_frame(self):
+        with self.lock:
+            return self.output_frame
+
+    def run(self):
+        self.is_running = True
+        print(f"Thread-{self.thread_id}: Starting object detection...")
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        while self.is_running:
+            if self.input_frame is None:
+                continue
+            with self.lock:
+                frame = self.input_frame.copy()
+            results = self.model(frame)
+            for info in results:
+                parameters = info.boxes
+                for box in parameters:
+                    x1, y1, x2, y2 = box.xyxy[0].numpy().astype("int")
+                    confidence = int(box.conf[0].numpy() * 100)
+                    index_class = int(box.cls[0])
+                    name_class = results[0].names[index_class]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(frame, f"{name_class} : {confidence / 100}", (x1 + 8, y1 - 12), font, 0.5, (255, 255, 255), 2)
+            with self.lock:
+                self.output_frame = frame
+
+    def stop(self):
+        print(f"Thread-{self.thread_id}: Stopping object detection...")
+        self.is_running = False
 
 
-class Yolo():
+class ControlSOD:
     def __init__(self):
-        ctx = tvm.cl(0)
+        self.video_capture = None
+        self.object_detect = None
 
-        self.darknet_lib = __darknetffi__.dlopen('../../model/yolo/libdarknet.so')
+    def start(self, access_url, model_path):
+        self.video_capture = VideoCaptureThread(thread_id=1, device_id=0)
+        self.object_detect = VideoObjectDetect(thread_id=2, device_id=0)
+        self.video_capture.assign_source(access_url)
+        self.object_detect.load_model(model_path)
+        self.video_capture.start()
+        self.object_detect.start()
+        self.display()
 
-        lib = tvm.module.load('../../model/yolo/yolov2.tar')
-        graph = open("../../model/yolo/yolov2").read()
-        params = bytearray(open("../../model/yolo/yolov2.params", "rb").read())
-        self.mod = graph_runtime.create(graph, lib, ctx)
-        self.mod.load_params(params)
-        print("mod load params successfully")
+    def display(self):
+        print("Starting display loop...")
+        while True:
+            frame = self.video_capture.get_frame()
+            if frame is not None:
+                self.object_detect.set_input_frame(frame)
+            output_frame = self.object_detect.get_output_frame()
+            if output_frame is not None:
+                cv2.imshow("Object Detection", output_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.stop()
+                break
 
-        self.parked_car_boxes = None
-        self.free_space_frames = 0
-        self.frame_index = 0
-
-    def get_car_boxes(self, filename):
-        im_w, im_h, data = get_data(filename, self.darknet_lib)
-
-        self.mod.set_input('data', tvm.nd.array(data.astype('float32')))
-
-        print("run", data.shape)
-        self.mod.run()
-        print("get_output")
-        tvm_out = self.mod.get_output(0).asnumpy().flatten()
-        print("tvm_out", tvm_out.shape)
-        result = convert.calc_result(im_w, im_h, tvm_out)
-
-        result_lines = result.splitlines()
-
-        # print(result_lines)
-
-        car_boxes = []
-        for line in result_lines:
-            _, item, prob, xmin, ymin, xmax, ymax = line.split(' ')
-            if item == 'car':
-                # print("car", xmin, ymin, xmax, ymax, im_w, im_h)
-                xmin = int(xmin)
-                xmax = int(xmax)
-                ymin = int(ymin)
-                ymax = int(ymax)
-
-                car_boxes.append((ymin, xmin, ymax, xmax))
-
-        return np.array(car_boxes)
-
-    def detect(self, image_path):
-
-        img = cv2.imread(image_path)
-        print("img.image_path", image_path)
-        print("img.shape", img.shape)
-
-        if self.parked_car_boxes is None:
-            # This is the first frame of video - assume all the cars detected are in parking spaces.
-            # Save the location of each car as a parking space box and go to the next frame of video.
-            self.parked_car_boxes = self.get_car_boxes(image_path)
-        else:
-            # We already know where the parking spaces are. Check if any are currently unoccupied.
-
-            # Get where cars are currently located in the frame
-            car_boxes = self.get_car_boxes(image_path)
-
-            print("self.parked_car_boxes", self.parked_car_boxes)
-            print("car_boxes", car_boxes)
-
-            # See how much those cars overlap with the known parking spaces
-            overlaps = compute_overlaps(self.parked_car_boxes, car_boxes)
-
-            print("overlaps", overlaps)
-            # Assume no spaces are free until we find one that is free
-            free_space = False
-
-            # Loop through each known parking space box
-            for parking_area, overlap_areas in zip(self.parked_car_boxes, overlaps):
-
-                # For this parking space, find the max amount it was covered by any
-                # car that was detected in our image (doesn't really matter which car)
-                max_IoU_overlap = np.max(overlap_areas)
-                max_IoU_overlap = float("%0.2f" % (max_IoU_overlap))
-
-                print("max_IoU_overlap", max_IoU_overlap)
-                # Get the top-left and bottom-right coordinates of the parking area
-                y1, x1, y2, x2 = parking_area
-
-                # Check if the parking space is occupied by seeing if any car overlaps
-                # it by more than 0.15 using IoU
-                if max_IoU_overlap < 0.15:
-                    # Parking space not occupied! Draw a green box around it
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                    # Flag that we have seen at least one open space
-                    free_space = True
-                else:
-                    # Parking space is still occupied - draw a red box around it
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 1)
-
-                # Write the IoU measurement inside the box
-                font = cv2.FONT_HERSHEY_DUPLEX
-
-                cv2.putText(img, str(max_IoU_overlap), (x1 + 6, y2 - 6), font, 0.3, (255, 255, 255))
-
-            cv2.imwrite("parking-"+str(self.frame_index)+".jpg", img)
-            print("imwrite ", "parking-"+str(self.frame_index)+".jpg")
-            # If at least one space was free, start counting frames
-            # This is so we don't alert based on one frame of a spot being open.
-            # This helps prevent the script triggered on one bad detection.
-            if free_space:
-                self.free_space_frames += 1
-            else:
-                # If no spots are free, reset the count
-                self.free_space_frames = 0
-
-            print("free_space_frames", self.free_space_frames)
-            # If a space has been free for several frames, we are pretty sure it is really free!
-            if self.free_space_frames > 10:
-                print("SPACE AVAILABLE!")
-                # Write SPACE AVAILABLE!! at the top of the screen
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(img, "SPACE AVAILABLE!", (10, 150), font, 3.0, (0, 255, 0), 2, cv2.FILLED)
-                cv2.imwrite("parking-avail.png", img)
-
-        self.frame_index = self.frame_index + 1
+    def stop(self):
+        print("Stopping system...")
+        if self.object_detect:
+            self.object_detect.stop()
+            self.object_detect.join()
+        if self.video_capture:
+            self.video_capture.stop()
+            self.video_capture.join()
+        cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
-    yolo = Yolo()
-    yolo.detect("frame-1-0000.jpg")
-    yolo.detect("frame-1-0000.jpg")
-
-
+CSOD = ControlSOD()
+CSOD.start(access_url='http://192.168.0.102:81/stream', model_path="./yolov10n.pt")
