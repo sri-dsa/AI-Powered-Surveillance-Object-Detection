@@ -1,42 +1,24 @@
-# docker build -t juanabascal/ai-surveillance .
+# syntax=docker/dockerfile:1.3
+FROM ubuntu:20.04
 
-# Image
-FROM python:3.9-slim-buster
+ENV DEBIAN_FRONTEND=noninteractive \
+    LS_DIR=/label-studio \
+    PIP_CACHE_DIR=/.cache \
+    DJANGO_SETTINGS_MODULE=core.settings.label_studio \
+    LABEL_STUDIO_BASE_DATA_DIR=/label-studio/data
 
-# Setting up working directory 
-WORKDIR /usr/src/app
-COPY requirements.txt ./
+WORKDIR $LS_DIR
 
-# Install system packages
-# RUN apt-get update && apt-get install python3  && apt-get install -y --no-install-recommends \
-RUN apt-get update && apt-get install -y \
-      bzip2 \
-      g++ \
-      git \
-      graphviz \
-      libgl1-mesa-glx \
-      libhdf5-dev \
-      openmpi-bin \
-      wget \
-      python3-tk \
-     && rm -rf /var/lib/apt/lists/*
+# install packages
+RUN set -eux \
+ && apt-get update \
+ && apt-get install --no-install-recommends --no-install-suggests -y \
+    build-essential postgresql-client libmysqlclient-dev mysql-client python3.8 python3-pip python3.8-dev \
+    uwsgi git libxml2-dev libxslt-dev zlib1g-dev libpq-dev python-dev
 
-# Ultralytics and opencv
-#RUN pip install ultralytics && \
-RUN pip install --no-cache-dir -r requirements.txt  
+RUN pip3 install label-studio==1.5.0
+RUN pip3 install djangorestframework==3.13.1 --upgrade
+EXPOSE 8080
 
-# Minimize image size 
-RUN (apt-get autoremove -y; \
-     apt-get autoclean -y)  
-
-COPY data/ ./data/
-COPY src/ ./src/
-COPY runSurveillance.sh ./
-RUN chmod +x runSurveillance.sh
-#COPY models/ ./models/
-
-ENV QT_X11_NO_MITSHM=1
-
-CMD ["bash"]
-# cd src
-#ENTRYPOINT [ "python", "./run_cam_surveillance.py"]
+# ENTRYPOINT ["./deploy/docker-entrypoint.sh"]
+CMD ["label-studio"]
